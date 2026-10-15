@@ -13,14 +13,22 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::RingBuf,
+    maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 use execsentry_common::{COMM_LEN, ExecEvent, FILENAME_LEN};
 
 /// Ring buffer de sortie (doit être une puissance de 2 multiple de la page).
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 256, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
+
+/// Nombre total d'`execve` vus par le programme noyau (par CPU).
+#[map]
+static EXEC_TOTAL: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Nombre d'événements jetés faute de place dans le ring buffer (par CPU).
+#[map]
+static EXEC_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Dans le format du tracepoint `sys_enter_execve`, `filename` est le 1er argument,
 /// situé à l'offset 16 (8 octets d'en-tête commun + 4 d'`__syscall_nr` + 4 de padding).
@@ -35,6 +43,8 @@ fn try_execsentry(ctx: TracePointContext) -> Result<u32, u32> {
     // Pointeur vers la chaîne `filename` en mémoire utilisateur.
     let filename_ptr =
         unsafe { ctx.read_at::<*const u8>(FILENAME_ARG_OFFSET) }.map_err(|_| 1u32)?;
+
+    increment(&EXEC_TOTAL);
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
@@ -60,9 +70,18 @@ fn try_execsentry(ctx: TracePointContext) -> Result<u32, u32> {
     if let Some(mut entry) = EVENTS.reserve::<ExecEvent>(0) {
         entry.write(event);
         entry.submit(0);
+    } else {
+        increment(&EXEC_DROPPED);
     }
 
     Ok(0)
+}
+
+/// Incrémente un compteur `PerCpuArray<u64>` d'une unité (au plus une entrée).
+fn increment(map: &PerCpuArray<u64>) {
+    if let Some(ptr) = map.get_ptr_mut(0) {
+        unsafe { *ptr += 1 };
+    }
 }
 
 #[cfg(not(test))]

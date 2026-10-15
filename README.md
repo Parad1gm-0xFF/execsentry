@@ -91,6 +91,20 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+## Fiabilité du consommateur
+
+Le ring buffer (1 MiB) est vidé sur notification `epoll` (`tokio::AsyncFd`), **et**
+par une vidange de sécurité toutes les 100 ms si aucune notification n'arrive :
+un consommateur affamé ne peut pas laisser le ring se remplir et perdre des
+événements. Deux compteurs `PerCpuArray` côté noyau (`EXEC_TOTAL`, `EXEC_DROPPED`)
+sont comparés en sortie au nombre d'événements reçus, ce qui rend toute perte
+visible :
+
+```
+execsentry arrêté : 42 reçues, 3 alertes.
+Noyau : 42 execve observés, 0 jetés (ring saturé).
+```
+
 ---
 
 ## Limites assumées

@@ -4,16 +4,30 @@
 //! `syscalls/sys_enter_execve`, puis consomme le ring buffer d'événements pour
 //! signaler les exécutions suspectes. Nécessite les privilèges root (`CAP_BPF`).
 
-use std::mem::size_of;
+use std::{
+    mem::size_of,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context as _, anyhow};
-use aya::{Ebpf, maps::ring_buf::RingBuf, programs::TracePoint};
+use aya::{
+    Ebpf,
+    maps::{MapData, PerCpuArray, ring_buf::RingBuf},
+    programs::TracePoint,
+};
 use clap::Parser;
 use execsentry_common::ExecEvent;
 use tokio::io::{Interest, unix::AsyncFd};
 
 mod policy;
 use policy::classify;
+
+/// Intervalle maximal sans notification avant une vidange de sécurité du ring.
+const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -48,43 +62,62 @@ async fn main() -> anyhow::Result<()> {
         .attach("syscalls", "sys_enter_execve")
         .context("attache du tracepoint syscalls/sys_enter_execve")?;
 
-    let map = ebpf
+    let events = ebpf
         .take_map("EVENTS")
         .ok_or_else(|| anyhow!("map 'EVENTS' introuvable"))?;
-    let ring = RingBuf::try_from(map)?;
+    let ring = RingBuf::try_from(events)?;
+    let exec_total = PerCpuArray::<MapData, u64>::try_from(ebpf.take_map("EXEC_TOTAL").unwrap())?;
+    let exec_dropped =
+        PerCpuArray::<MapData, u64>::try_from(ebpf.take_map("EXEC_DROPPED").unwrap())?;
+
     // SAFETY: `register_with_interest` exige que le fd appartienne à `T` et reste
     // vivant : c'est le cas, `AsyncFd` prend possession du `RingBuf` et le garde.
     let mut async_fd = unsafe { AsyncFd::register_with_interest(ring, Interest::READABLE)? };
 
+    let shutdown = Arc::new(AtomicBool::new(false));
+    spawn_ctrl_c_handler(Arc::clone(&shutdown));
+
     banner();
 
-    let mut total: u64 = 0;
+    let mut received: u64 = 0;
     let mut alerts: u64 = 0;
 
-    loop {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break;
-            }
-            guard = async_fd.readable_mut() => {
+    while !shutdown.load(Ordering::Relaxed) {
+        match tokio::time::timeout(DRAIN_INTERVAL, async_fd.readable_mut()).await {
+            Ok(guard) => {
                 let mut guard = guard?;
-                let ring = guard.get_inner_mut();
-                while let Some(item) = ring.next() {
-                    if let Some(event) = decode(&item) {
-                        total += 1;
-                        if report(&event, opt.verbose) {
-                            alerts += 1;
-                        }
-                    }
-                }
+                drain(
+                    guard.get_inner_mut(),
+                    opt.verbose,
+                    &mut received,
+                    &mut alerts,
+                );
                 guard.clear_ready();
             }
+            // Aucune notification dans l'intervalle : vidange de sécurité, pour ne
+            // jamais laisser le ring se remplir et perdre des événements.
+            Err(_) => drain(async_fd.get_mut(), opt.verbose, &mut received, &mut alerts),
         }
     }
 
-    println!("\nexecsentry arrêté : {total} exécutions observées, {alerts} alertes.");
+    let observed = per_cpu_sum(&exec_total)?;
+    let dropped = per_cpu_sum(&exec_dropped)?;
+
+    println!("\nexecsentry arrêté : {received} reçues, {alerts} alertes.");
+    println!("Noyau : {observed} execve observés, {dropped} jetés (ring saturé).");
     Ok(())
+}
+
+/// Vide tout le ring buffer disponible et met à jour les compteurs.
+fn drain(ring: &mut RingBuf<MapData>, verbose: bool, received: &mut u64, alerts: &mut u64) {
+    while let Some(item) = ring.next() {
+        if let Some(event) = decode(&item) {
+            *received += 1;
+            if report(&event, verbose) {
+                *alerts += 1;
+            }
+        }
+    }
 }
 
 /// Réinterprète les octets d'une entrée de ring buffer en [`ExecEvent`].
@@ -131,6 +164,20 @@ fn report(event: &ExecEvent, verbose: bool) -> bool {
             false
         }
     }
+}
+
+/// Somme une carte `PerCpuArray` sur l'ensemble des CPU.
+fn per_cpu_sum(map: &PerCpuArray<MapData, u64>) -> anyhow::Result<u64> {
+    Ok(map.get(&0u32, 0)?.iter().copied().sum())
+}
+
+/// Enregistre un gestionnaire Ctrl-C qui positionne le drapeau d'arrêt.
+fn spawn_ctrl_c_handler(shutdown: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown.store(true, Ordering::Relaxed);
+        }
+    });
 }
 
 fn banner() {
