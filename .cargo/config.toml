@@ -1,0 +1,4 @@
+# bpf-linker est le seul linker capable de produire un objet eBPF depuis rustc.
+# Il doit être installé (`cargo install bpf-linker` ou binaire de release).
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
