@@ -91,6 +91,15 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+## Attache sur tous les CPU (piège aya)
+
+`aya::programs::TracePoint::attach` n'ouvre un `perf_event` que pour le **CPU 0**
+(`perf_event_open_trace_point(id, None)` → `PerfEventScope::AllProcessesOneCpu { cpu: 0 }`),
+donc seuls les `execve` tombant sur ce CPU sont vus. L'agent attache donc lui-même
+le programme à un `perf_event` **par CPU** (`perf_event_open(pid=-1, cpu=N)` +
+`PERF_EVENT_IOC_SET_BPF` + `PERF_EVENT_IOC_ENABLE`), ce qui couvre toute la
+machine. Les compteurs noyau le confirment : `observés == reçues`.
+
 ## Fiabilité du consommateur
 
 Le ring buffer (1 MiB) est vidé sur notification `epoll` (`tokio::AsyncFd`), **et**
