@@ -1,20 +1,21 @@
 #![no_std]
 #![no_main]
-//! Programme eBPF de l'agent : tracepoint noyau `syscalls/sys_enter_execve`.
+//! Programme eBPF de l'agent : `fentry` sur `__x64_sys_execve`.
 //!
-//! À chaque appel système `execve`, le programme capture l'identité de la tâche
-//! (pid/tgid, uid/gid), son `comm` et le chemin du binaire cible (lu depuis la
-//! mémoire utilisateur avec `bpf_probe_read_user_str_bytes`), puis publie un
-//! [`ExecEvent`] dans un ring buffer consommé par le chargeur userspace.
+//! `fentry` (BPF trampoline) s'attache via un seul lien couvrant **tous** les CPU,
+//! contrairement aux tracepoints attachés par `perf_event` (un par CPU, refusés
+//! quand on réutilise le même programme). Le contexte est la fonction hookée :
+//! `__x64_sys_execve(struct pt_regs *regs)`.
 
 use aya_ebpf::{
+    bindings::pt_regs,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
     },
-    macros::{map, tracepoint},
+    macros::{fentry, map},
     maps::{PerCpuArray, RingBuf},
-    programs::TracePointContext,
+    programs::FEntryContext,
 };
 use execsentry_common::{COMM_LEN, ExecEvent, FILENAME_LEN};
 
@@ -30,19 +31,23 @@ static EXEC_TOTAL: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static EXEC_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
-/// Dans le format du tracepoint `sys_enter_execve`, `filename` est le 1er argument,
-/// situé à l'offset 16 (8 octets d'en-tête commun + 4 d'`__syscall_nr` + 4 de padding).
-const FILENAME_ARG_OFFSET: usize = 16;
+#[cfg(not(bpf_target_arch = "x86_64"))]
+compile_error!("execsentry cible x86_64 : hook `__x64_sys_execve` (adapter pour une autre arch).");
 
-#[tracepoint]
-pub fn execsentry(ctx: TracePointContext) -> u32 {
+#[fentry(function = "__x64_sys_execve")]
+pub fn execsentry(ctx: FEntryContext) -> u32 {
     try_execsentry(ctx).unwrap_or(0)
 }
 
-fn try_execsentry(ctx: TracePointContext) -> Result<u32, u32> {
-    // Pointeur vers la chaîne `filename` en mémoire utilisateur.
-    let filename_ptr =
-        unsafe { ctx.read_at::<*const u8>(FILENAME_ARG_OFFSET) }.map_err(|_| 1u32)?;
+fn try_execsentry(ctx: FEntryContext) -> Result<u32, u32> {
+    // Premier argument de `__x64_sys_execve(struct pt_regs *regs)`.
+    let regs_ptr = ctx.arg::<*const pt_regs>(0);
+    if regs_ptr.is_null() {
+        return Err(1);
+    }
+    let regs = unsafe { bpf_probe_read_kernel(regs_ptr) }.map_err(|_| 2u32)?;
+    // `rdi` = premier argument du syscall `execve` : le chemin cible (user).
+    let filename_ptr = regs.rdi as *const u8;
 
     increment(&EXEC_TOTAL);
 

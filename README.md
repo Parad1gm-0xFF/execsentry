@@ -1,7 +1,7 @@
 # execsentry
 
-> Agent de sécurité Linux en **Rust** + **eBPF** : il s'attache au tracepoint
-> noyau `syscalls/sys_enter_execve`, capture chaque exécution de programme
+> Agent de sécurité Linux en **Rust** + **eBPF** : il s'attache en **fentry** au
+> syscall `__x64_sys_execve`, capture chaque exécution de programme
 > (identité de la tâche, `comm`, chemin du binaire lu en mémoire utilisateur) et
 > signale les exécutions suspectes.
 
@@ -15,12 +15,12 @@ l'écriture de **Rust système**, côté noyau (`no_std`) comme côté utilisate
 
 | Compétence visée | Preuve dans ce dépôt |
 |---|---|
-| Programmation eBPF en **Rust** | Programme `no_std` + `no_main` (aya-ebpf), macro `#[tracepoint]` |
-| Attachement bas niveau | Tracepoint noyau `syscalls/sys_enter_execve` (offsets de `pt_regs`) |
+| Programmation eBPF en **Rust** | Programme `no_std` + `no_main` (aya-ebpf), macro `#[fentry]` |
+| Attachement bas niveau | `fentry` sur `__x64_sys_execve` (trampoline BPF, `struct pt_regs`) |
 | Lecture mémoire utilisateur | `bpf_probe_read_user_str_bytes` du chemin `filename` |
 | Ring buffer noyau -> user | `RingBuf` côté eBPF, consommation `epoll`/`AsyncFd` côté Rust |
 | Rust système | Loader `aya`, `#[repr(C)]` partagé, `Pod`, `read_unaligned` |
-| Contrats partagés | Crate `execsentry-common` compilée à la fois pour `bpfel` et pour l'hôte |
+| Diagnostic / comptage | Compteurs `PerCpuArray` comparés au reçu (détection de perte) |
 | Politique de détection | Module `policy` pur, testé unitairement (7 tests) |
 
 ---
@@ -29,11 +29,11 @@ l'écriture de **Rust système**, côté noyau (`no_std`) comme côté utilisate
 
 ```
 execsentry-common/   Types partagés (ExecEvent #[repr(C)], contrat Pod)
-execsentry-ebpf/     Programme eBPF (no_std) : tracepoint sys_enter_execve -> RingBuf
+execsentry-ebpf/     Programme eBPF (no_std) : fentry __x64_sys_execve -> RingBuf
 execsentry/          Chargeur userspace : aya + tokio (AsyncFd), politique de détection
 ```
 
-Flux : `execve` -> tracepoint -> programme eBPF -> `ExecEvent` dans le ring buffer
+Flux : `execve` -> fentry -> programme eBPF -> `ExecEvent` dans le ring buffer
 -> chargeur Rust -> classification (bénin / SUSPICIOUS / CRITICAL) -> sortie.
 
 ## Règles de détection
@@ -91,14 +91,25 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-## Attache sur tous les CPU (piège aya)
+## Pourquoi fentry plutôt qu'un tracepoint
 
-`aya::programs::TracePoint::attach` n'ouvre un `perf_event` que pour le **CPU 0**
-(`perf_event_open_trace_point(id, None)` → `PerfEventScope::AllProcessesOneCpu { cpu: 0 }`),
-donc seuls les `execve` tombant sur ce CPU sont vus. L'agent attache donc lui-même
-le programme à un `perf_event` **par CPU** (`perf_event_open(pid=-1, cpu=N)` +
-`PERF_EVENT_IOC_SET_BPF` + `PERF_EVENT_IOC_ENABLE`), ce qui couvre toute la
-machine. Les compteurs noyau le confirment : `observés == reçues`.
+Premier essai : `#[tracepoint]` sur `syscalls/sys_enter_execve`. Deux obstacles
+rencontrés sur le noyau cible :
+
+1. `aya::programs::TracePoint::attach` n'ouvre un `perf_event` que pour le **CPU 0**
+   (`perf_event_open_trace_point(id, None)` → `PerfEventScope::AllProcessesOneCpu { cpu: 0 }`) :
+   seuls les `execve` tombant sur ce CPU étaient vus (compteur noyau ≈ 2 sur une
+   session entière).
+2. L'attache du **même** programme à un `perf_event` par CPU est refusée :
+   `perf_event_attach_bpf_prog()` renvoie `-EEXIST`, car `bpf_prog_array_copy()`
+   interdit qu'un même programme apparaisse deux fois dans le `prog_array`
+   (partagé par tracepoint).
+
+Solution retenue : **`fentry`** (`BPF_TRACE_FENTRY`, trampoline BPF), attaché par
+un **seul lien global** qui couvre tous les CPU, sans événement perf. Le contexte
+est la fonction hookée : `__x64_sys_execve(struct pt_regs *regs)`, donc le chemin
+est le premier argument du syscall (`regs.rdi`). Les compteurs le confirment :
+`observés == reçues`.
 
 ## Fiabilité du consommateur
 
@@ -118,8 +129,9 @@ Noyau : 42 execve observés, 0 jetés (ring saturé).
 
 ## Limites assumées
 
-- Le programme s'attache à `sys_enter_execve` (événement à l'entrée de l'appel),
-  pas à un hook LSM : pas de blocage possible, on observe. Un hook LSM eBPF
+- Le hook est **x86_64** (`__x64_sys_execve`, `regs.rdi`) ; un portage aarch64
+  utiliserait `__arm64_sys_execve` et `regs.regs[0]`.
+- On observe à l'entrée de l'appel, on ne **bloque** pas : un hook LSM eBPF
   (`lsm/bprm_check_security`) serait la suite logique mais exige `lsm=bpf` au boot.
 - `comm` est le nom de tâche **avant** `exec` (donc le programme appelant).
 - La séparation `comm`/`filename` et l'absence d'`argv` limitent la finesse de la
